@@ -31,6 +31,8 @@ class PDFToolkitApp:
 
         # Track whether dark mode is active
         self.is_dark_mode = False
+        # Keep track of the most recent files dropped onto the app window
+        self.last_dropped_paths: List[str] = []
 
         # Define modern color palettes for light and dark themes.  These can be
         # tweaked to taste.  Light theme uses bright backgrounds with a blue
@@ -80,7 +82,7 @@ class PDFToolkitApp:
         self.toggle_btn.pack(pady=10, anchor="ne")
         self.toggle_btn.bind("<Button-1>", self.toggle_theme)
         # Create a simple tooltip for the toggle button
-        self.toggle_btn.tooltip = tk.Label(
+        self.toggle_btn_tooltip = tk.Label(
             self.sidebar,
             text="Change Mode",
             bg="black",
@@ -90,14 +92,15 @@ class PDFToolkitApp:
             relief="solid",
         )
         self.toggle_btn.bind(
-            "<Enter>", lambda e: self.toggle_btn.tooltip.place(x=50, y=10)
+            "<Enter>", lambda e: self.toggle_btn_tooltip.place(x=50, y=10)
         )
         self.toggle_btn.bind(
-            "<Leave>", lambda e: self.toggle_btn.tooltip.place_forget()
+            "<Leave>", lambda e: self.toggle_btn_tooltip.place_forget()
         )
 
         # Buttons for available actions; each corresponds to a method below
         self.buttons = []
+        self.button_frames = []
         actions = [
             ("Excel to PDF", self.excel_to_pdf),
             ("PDF to Excel", self.pdf_to_excel),
@@ -131,6 +134,7 @@ class PDFToolkitApp:
             btn.pack(fill="x")
             frame.pack(pady=5, padx=10, fill="x")
             self.buttons.append(btn)
+            self.button_frames.append(frame)
 
         # Status label to display currently selected file or operation status
         self.status_label = tk.Label(
@@ -162,6 +166,7 @@ class PDFToolkitApp:
             self.content,
             bg=self.light_theme["content_bg"],
         )
+        self.bottom_frame.columnconfigure(0, weight=1)
         # Progress bar to indicate long running tasks; default to indeterminate
         self.progress = ttk.Progressbar(
             self.bottom_frame,
@@ -169,7 +174,7 @@ class PDFToolkitApp:
             mode="indeterminate",
             length=200,
         )
-        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         # Clear preview button next to the progress bar
         self.clear_btn = tk.Button(
             self.bottom_frame,
@@ -180,9 +185,12 @@ class PDFToolkitApp:
             relief="flat",
             cursor="hand2",
         )
-        self.clear_btn.pack(side="right")
+        self.clear_btn.grid(row=0, column=1, sticky="e")
         # Pack the bottom frame
         self.bottom_frame.pack(pady=5, padx=10, fill="x")
+
+        # Enable drag-and-drop on Windows for quick file selection/preview
+        self.setup_drag_and_drop()
 
         # Apply the initial theme settings
         self.set_theme()
@@ -210,6 +218,8 @@ class PDFToolkitApp:
         # Sidebar and content backgrounds
         self.sidebar.config(bg=theme["sidebar_bg"])
         self.content.config(bg=theme["content_bg"])
+        for frame in getattr(self, "button_frames", []):
+            frame.config(bg=theme["sidebar_bg"])
 
         # Header and status labels
         self.header_label.config(bg=theme["content_bg"], fg=theme["header_fg"])
@@ -264,6 +274,180 @@ class PDFToolkitApp:
         self.progress.config(style=bar_style)
 
     # ------------------------------------------------------------------
+    # Drag-and-drop support (Windows)
+    # ------------------------------------------------------------------
+    def setup_drag_and_drop(self) -> None:
+        """
+        Register OS-level drag-and-drop for the main window (Windows only).
+
+        This hooks the window procedure so dropped files arrive in
+        ``handle_dropped_files``. It is intentionally no-op on non-Windows
+        systems so the rest of the app continues to work unchanged.
+        """
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception as exc:  # noqa: BLE001
+            print("Drag-and-drop unavailable:", exc)
+            return
+
+        # Type aliases for Win32 pointer-sized values
+        LONG_PTR = ctypes.c_ssize_t
+        WPARAM = ctypes.c_size_t
+        LPARAM = ctypes.c_ssize_t
+        LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+
+        WM_DROPFILES = 0x0233
+        GWL_WNDPROC = -4
+        DragAcceptFiles = shell32.DragAcceptFiles
+        DragQueryFileW = shell32.DragQueryFileW
+        DragFinish = shell32.DragFinish
+        CallWindowProcW = user32.CallWindowProcW
+        SetWindowLongPtrW = user32.SetWindowLongPtrW
+        DefWindowProcW = user32.DefWindowProcW
+        DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        DragAcceptFiles.restype = None
+        DragQueryFileW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_uint,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+        ]
+        DragQueryFileW.restype = ctypes.c_uint
+        DragFinish.argtypes = [wintypes.HANDLE]
+        DragFinish.restype = None
+        # Ensure correct signatures to avoid pointer truncation
+        SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
+        SetWindowLongPtrW.restype = LONG_PTR
+        CallWindowProcW.argtypes = [
+            LONG_PTR,
+            wintypes.HWND,
+            wintypes.UINT,
+            WPARAM,
+            LPARAM,
+        ]
+        CallWindowProcW.restype = LONG_PTR
+        DefWindowProcW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            WPARAM,
+            LPARAM,
+        ]
+        DefWindowProcW.restype = LRESULT
+
+        hwnd = self.root.winfo_id()
+
+        WNDPROC = ctypes.WINFUNCTYPE(
+            LRESULT,
+            wintypes.HWND,
+            wintypes.UINT,
+            WPARAM,
+            LPARAM,
+        )
+
+        def wnd_proc(hWnd, msg, wParam, lParam):
+            if msg == WM_DROPFILES:
+                try:
+                    file_count = DragQueryFileW(wParam, 0xFFFFFFFF, None, 0)
+                    paths: List[str] = []
+                    for i in range(file_count):
+                        length = DragQueryFileW(wParam, i, None, 0) + 1
+                        buffer = ctypes.create_unicode_buffer(length)
+                        DragQueryFileW(wParam, i, buffer, length)
+                        paths.append(buffer.value)
+                    DragFinish(wParam)
+                    # Handle on the Tk event loop to avoid thread issues
+                    self.root.after(0, lambda p=paths: self.handle_dropped_files(p))
+                except Exception as exc_inner:  # noqa: BLE001
+                    print("Drag/drop error:", exc_inner)
+                return 0
+            # If no previous window proc was stored, fall back to default
+            if not self._old_wnd_proc:
+                return DefWindowProcW(hWnd, msg, wParam, lParam)
+            try:
+                return CallWindowProcW(self._old_wnd_proc, hWnd, msg, wParam, lParam)
+            except Exception as exc_call:  # noqa: BLE001
+                print("CallWindowProcW error:", exc_call)
+                return DefWindowProcW(hWnd, msg, wParam, lParam)
+
+        try:
+            self._new_wnd_proc = WNDPROC(wnd_proc)
+            new_proc_ptr = ctypes.cast(self._new_wnd_proc, ctypes.c_void_p).value
+            self._old_wnd_proc = int(SetWindowLongPtrW(
+                hwnd,
+                GWL_WNDPROC,
+                LONG_PTR(new_proc_ptr),
+            ))
+            DragAcceptFiles(hwnd, True)
+        except Exception as exc:  # noqa: BLE001
+            print("Unable to enable drag-and-drop:", exc)
+
+    def handle_dropped_files(self, paths: List[str]) -> None:
+        """
+        Handle files dropped onto the application window.
+
+        The first dropped file is previewed (PDF or image). All dropped
+        paths are retained in ``self.last_dropped_paths`` for quick reuse.
+        """
+        if not paths:
+            return
+        files = [p for p in paths if os.path.isfile(p)]
+        if not files:
+            return
+        self.last_dropped_paths = files
+        primary = files[0]
+        name = os.path.basename(primary)
+        self.status_label.config(text=f"Dropped: {name}")
+        ext = os.path.splitext(primary)[1].lower()
+        if ext == ".pdf":
+            self.preview_pdf_page(primary)
+        elif ext in (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tiff",
+            ".tif",
+            ".gif",
+            ".ico",
+            ".webp",
+        ):
+            self.preview_image_file(primary)
+        else:
+            messagebox.showinfo(
+                "Drag & Drop",
+                f"Received {name}. Choose an action from the sidebar to process it.",
+            )
+
+    def get_dropped_files(
+        self, allowed_exts: tuple[str, ...], multiple: bool = False
+    ) -> Optional[List[str]]:
+        """
+        Return dropped file(s) if available and matching the expected extensions.
+
+        When ``multiple`` is False, a single matching file (the first) is
+        returned; otherwise, all matching dropped files are returned. If no
+        suitable dropped files exist, None is returned and callers can fall
+        back to a file dialog.
+        """
+        if not self.last_dropped_paths:
+            return None
+        filtered = [
+            p
+            for p in self.last_dropped_paths
+            if os.path.splitext(p)[1].lower() in allowed_exts
+            and os.path.isfile(p)
+        ]
+        if not filtered:
+            return None
+        return filtered if multiple else [filtered[0]]
+
+    # ------------------------------------------------------------------
     # Action handlers
     # ------------------------------------------------------------------
     def excel_to_pdf(self) -> None:
@@ -277,7 +461,14 @@ class PDFToolkitApp:
         landscape orientation if the sheet is wide.  Headers are repeated on
         each page for readability.
         """
-        excel_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
+        excel_path = None
+        dropped = self.get_dropped_files((".xlsx", ".xls"), multiple=False)
+        if dropped:
+            excel_path = dropped[0]
+        else:
+            excel_path = filedialog.askopenfilename(
+                filetypes=[("Excel Files", "*.xlsx *.xls")]
+            )
         if not excel_path:
             return
         self.status_label.config(text=f"Selected: {os.path.basename(excel_path)}")
@@ -398,7 +589,12 @@ class PDFToolkitApp:
         cancels the file selection or the PDF has no extractable text,
         the operation is aborted gracefully.
         """
-        pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not pdf_path:
             return
         self.status_label.config(text=f"Selected: {os.path.basename(pdf_path)}")
@@ -460,7 +656,12 @@ class PDFToolkitApp:
         tables to a separate sheet in the output workbook.  Header rows are
         preserved if possible, but table structure may vary from PDF to PDF.
         """
-        pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not pdf_path:
             return
 
@@ -570,7 +771,12 @@ class PDFToolkitApp:
 
     def pdf_to_word(self) -> None:
         """Convert a PDF file (or a range of pages) to a Word (.docx) document."""
-        pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not pdf_path:
             return
 
@@ -621,7 +827,10 @@ class PDFToolkitApp:
                 end_idx = last_page_in - 1
             # Convert specified page range (or all pages if end_idx is None)
             cv = Converter(pdf_path)
-            cv.convert(docx_path, start=start_idx, end=end_idx)
+            if end_idx is None:
+                cv.convert(docx_path, start=start_idx)
+            else:
+                cv.convert(docx_path, start=start_idx, end=end_idx)
             cv.close()
             self.status_label.config(text=f"Saved as: {os.path.basename(docx_path)}")
             messagebox.showinfo("Success", f"Word document saved as {docx_path}")
@@ -642,8 +851,13 @@ class PDFToolkitApp:
         generally effective for scanned PDFs but may reduce vector
         fidelity.
         """
-        # Prompt the user to select a PDF to compress
-        pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        # Use a dropped file if present; otherwise prompt the user
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not pdf_path:
             return
 
@@ -705,13 +919,13 @@ class PDFToolkitApp:
                     # Compute zoom factor based on DPI
                     zoom = dpi / 72.0
                     mat = fitz.Matrix(zoom, zoom)
-                    pix = page.get_pixmap(matrix=mat)
+                    pix = page.get_pixmap(matrix=mat)  # type: ignore[attr-defined]
                     # Convert to PIL image and compress as JPEG
                     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=quality)
                     page.clean_contents()
-                    page.insert_image(page.rect, stream=buf.getvalue())
+                    page.insert_image(page.rect, stream=buf.getvalue())  # type: ignore[attr-defined]
                 doc.save(output_path)
                 doc.close()
             elif out_size >= input_size:
@@ -740,12 +954,25 @@ class PDFToolkitApp:
         reasonable visual fidelity.  Additional image formats such as
         TIFF, TIF, ICO and WEBP are supported.
         """
-        img_paths = filedialog.askopenfilenames(
-            filetypes=[(
-                "Image Files",
-                "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
-            )]
+        allowed_exts = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tiff",
+            ".tif",
+            ".gif",
+            ".ico",
+            ".webp",
         )
+        img_paths = self.get_dropped_files(allowed_exts, multiple=True)
+        if not img_paths:
+            img_paths = filedialog.askopenfilenames(
+                filetypes=[(
+                    "Image Files",
+                    "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
+                )]
+            )
         if not img_paths:
             return
 
@@ -778,8 +1005,9 @@ class PDFToolkitApp:
                 messagebox.showwarning("No Images", "No valid images selected.")
                 return
             # Write the compressed images into a single PDF
+            merged_bytes = img2pdf.convert(images_data)
             with open(pdf_path, "wb") as f:
-                f.write(img2pdf.convert(images_data))
+                f.write(merged_bytes)
             self.status_label.config(
                 text=f"Saved as: {os.path.basename(pdf_path)}"
             )
@@ -789,9 +1017,44 @@ class PDFToolkitApp:
         finally:
             self.progress.stop()
 
+    def preview_image_file(self, img_path: str) -> None:
+        """
+        Preview an image file in the main canvas, scaling to fit.
+
+        The image is resized to the current canvas dimensions while
+        preserving aspect ratio, and the Tk reference is kept alive
+        on the instance to avoid garbage collection.
+        """
+        try:
+            img_prev = Image.open(img_path)
+            self.root.update_idletasks()
+            canvas_width = self.preview_canvas.winfo_width()
+            canvas_height = self.preview_canvas.winfo_height()
+            if canvas_width <= 10 or canvas_height <= 10:
+                max_width, max_height = 400, 500
+            else:
+                max_width, max_height = canvas_width, canvas_height
+            ratio = min(max_width / img_prev.width, max_height / img_prev.height)
+            if ratio <= 0 or ratio is None:
+                ratio = 1.0
+            new_width = int(img_prev.width * ratio)
+            new_height = int(img_prev.height * ratio)
+            resized_img = img_prev.resize(
+                (new_width, new_height), Image.Resampling.LANCZOS
+            )
+            self.tk_img = ImageTk.PhotoImage(resized_img)
+            self.preview_canvas.delete("all")
+            x = max(0, (max_width - new_width) // 2)
+            y = max(0, (max_height - new_height) // 2)
+            self.preview_canvas.create_image(x, y, anchor="nw", image=self.tk_img)
+        except Exception as e:  # noqa: BLE001
+            print("Preview error:", e)
+
     def merge_pdfs(self) -> None:
         """Merge multiple PDF files into a single PDF."""
-        files = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
+        files = self.get_dropped_files((".pdf",), multiple=True)
+        if not files:
+            files = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
         if not files:
             return
 
@@ -811,7 +1074,12 @@ class PDFToolkitApp:
 
     def split_pdf(self) -> None:
         """Split a range of pages from a PDF into a new PDF file."""
-        file = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        file = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            file = dropped[0]
+        else:
+            file = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not file:
             return
 
@@ -844,7 +1112,12 @@ class PDFToolkitApp:
         thousands of pages into memory at once. The resulting images are
         saved to a user-selected folder.
         """
-        pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if not pdf_path:
             return
 
@@ -895,12 +1168,14 @@ class PDFToolkitApp:
         self.status_label.config(text=f"Selected: {os.path.basename(pdf_path)}")
         try:
             # Convert the specified page range to images
-            pages = convert_from_path(
-                pdf_path,
-                dpi=300,
-                first_page=first_page,
-                last_page=last_page,
-            )
+            convert_kwargs = {
+                "pdf_path": pdf_path,
+                "dpi": 300,
+                "first_page": first_page,
+            }
+            if last_page is not None:
+                convert_kwargs["last_page"] = last_page
+            pages = convert_from_path(**convert_kwargs)
             # Ask user for output directory
             folder = filedialog.askdirectory()
             if not folder:
@@ -915,7 +1190,9 @@ class PDFToolkitApp:
 
     def batch_compress(self) -> None:
         """Compress multiple PDFs in one operation."""
-        files = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
+        files = self.get_dropped_files((".pdf",), multiple=True)
+        if not files:
+            files = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
         if not files:
             return
         # Start the progress bar in indeterminate mode for batch processing
@@ -939,14 +1216,14 @@ class PDFToolkitApp:
                         for page in doc:
                             zoom = 150 / 72.0
                             mat = fitz.Matrix(zoom, zoom)
-                            pix = page.get_pixmap(matrix=mat)
-                            img = Image.frombytes(
-                                "RGB", (pix.width, pix.height), pix.samples
-                            )
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG", quality=80)
-                            page.clean_contents()
-                            page.insert_image(page.rect, stream=buf.getvalue())
+                    pix = page.get_pixmap(matrix=mat)  # type: ignore[attr-defined]
+                    img = Image.frombytes(
+                        "RGB", (pix.width, pix.height), pix.samples
+                    )
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=80)
+                    page.clean_contents()
+                    page.insert_image(page.rect, stream=buf.getvalue())  # type: ignore[attr-defined]
                         doc.save(output)
                         doc.close()
                 except Exception:
@@ -995,8 +1272,7 @@ class PDFToolkitApp:
                 y = max(0, (max_height - new_height) // 2)
                 self.preview_canvas.create_image(x, y, anchor="nw", image=self.tk_img)
         except Exception as e:  # noqa: BLE001
-            # If preview fails, silently ignore; optionally log to console
-            print("Preview error:", e)
+            self.status_label.config(text=f"Preview unavailable: {e}")
 
     def merge_images_to_pdf(self) -> None:
         """
@@ -1007,12 +1283,25 @@ class PDFToolkitApp:
         ``img2pdf``.  Supporting many common image formats ensures broad
         compatibility.  The resulting PDF is previewed once written.
         """
-        img_paths = filedialog.askopenfilenames(
-            filetypes=[(
-                "Image Files",
-                "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
-            )]
+        allowed_exts = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tiff",
+            ".tif",
+            ".gif",
+            ".ico",
+            ".webp",
         )
+        img_paths = self.get_dropped_files(allowed_exts, multiple=True)
+        if not img_paths:
+            img_paths = filedialog.askopenfilenames(
+                filetypes=[(
+                    "Image Files",
+                    "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
+                )]
+            )
         if not img_paths:
             return
 
@@ -1071,13 +1360,26 @@ class PDFToolkitApp:
         Unsupported or unreadable files are silently skipped, and a preview of
         the first compressed image is displayed in the preview pane.
         """
-        # Prompt the user for the image files to compress
-        img_paths = filedialog.askopenfilenames(
-            filetypes=[(
-                "Image Files",
-                "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
-            )]
+        # Prompt the user for the image files to compress (or use dropped files)
+        allowed_exts = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tiff",
+            ".tif",
+            ".gif",
+            ".ico",
+            ".webp",
         )
+        img_paths = self.get_dropped_files(allowed_exts, multiple=True)
+        if not img_paths:
+            img_paths = filedialog.askopenfilenames(
+                filetypes=[(
+                    "Image Files",
+                    "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif;*.ico;*.webp",
+                )]
+            )
         if not img_paths:
             return
 
