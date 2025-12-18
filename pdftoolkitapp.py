@@ -1,9 +1,8 @@
-
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import pandas as pd
 
@@ -15,9 +14,27 @@ from pdf2image import convert_from_path
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
 import pdfplumber
 
-# If Tesseract is installed on the system, uncomment and adjust the path
-# import pytesseract
-# pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+# Additional imports for extended functionality
+# Word→PDF conversion may use docx2pdf if available
+try:
+    from docx2pdf import convert as docx2pdf_convert  # type: ignore
+except Exception:
+    docx2pdf_convert = None  # type: ignore
+
+# Fallback COM automation for Word→PDF
+try:
+    import win32com.client  # type: ignore
+except Exception:
+    win32com = None  # type: ignore
+
+# Use pikepdf for encryption/decryption if available
+try:
+    import pikepdf  # type: ignore
+except Exception:
+    pikepdf = None  # type: ignore
+
+from reportlab.pdfgen import canvas  # type: ignore
+from reportlab.lib.pagesizes import letter as reportlab_letter  # type: ignore
 
 
 class PDFToolkitApp:
@@ -64,17 +81,17 @@ class PDFToolkitApp:
         self.sun_image = ImageTk.PhotoImage(Image.open("sun.png").resize((24, 24)))
         self.moon_image = ImageTk.PhotoImage(Image.open("moon.png").resize((24, 24)))
 
-        # Create sidebar for actions
+        # Create sidebar for actions with a scrollable area
         self.sidebar = tk.Frame(root, bg=self.light_theme["sidebar_bg"], width=200)
         self.sidebar.pack(side="left", fill="y")
 
-        # Create main content area for previews and status
-        self.content = tk.Frame(root, bg=self.light_theme["content_bg"])
-        self.content.pack(side="right", expand=True, fill="both")
+        # Split sidebar into a top section (for the theme toggle) and a scrollable section (for buttons)
+        self.top_sidebar_frame = tk.Frame(self.sidebar, bg=self.light_theme["sidebar_bg"])
+        self.top_sidebar_frame.pack(side="top", fill="x")
 
-        # Toggle button for switching themes
+        # Toggle button for switching themes; placed in top frame so it stays visible
         self.toggle_btn = tk.Label(
-            self.sidebar,
+            self.top_sidebar_frame,
             image=self.sun_image,
             cursor="hand2",
             bg="#f0f0f0",
@@ -83,7 +100,7 @@ class PDFToolkitApp:
         self.toggle_btn.bind("<Button-1>", self.toggle_theme)
         # Create a simple tooltip for the toggle button
         self.toggle_btn_tooltip = tk.Label(
-            self.sidebar,
+            self.top_sidebar_frame,
             text="Change Mode",
             bg="black",
             fg="white",
@@ -98,28 +115,92 @@ class PDFToolkitApp:
             "<Leave>", lambda e: self.toggle_btn_tooltip.place_forget()
         )
 
-        # Buttons for available actions; each corresponds to a method below
+        # Canvas and scrollbar to make the button list scrollable. This allows the sidebar to
+        # accommodate many buttons even in a small window.
+        self.sidebar_canvas = tk.Canvas(
+            self.sidebar,
+            bg=self.light_theme["sidebar_bg"],
+            highlightthickness=0,
+        )
+        self.sidebar_vscrollbar = tk.Scrollbar(
+            self.sidebar, orient="vertical", command=self.sidebar_canvas.yview
+        )
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_vscrollbar.set)
+        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self.sidebar_vscrollbar.pack(side="right", fill="y")
+
+        # Frame inside the canvas to hold all the action buttons
+        self.buttons_frame = tk.Frame(self.sidebar_canvas, bg=self.light_theme["sidebar_bg"])
+        # Add the frame into the canvas window; tag it for resizing
+        self.sidebar_canvas.create_window(
+            (0, 0), window=self.buttons_frame, anchor="nw", tags=("buttons_frame",)
+        )
+        # Ensure the scrollregion is updated whenever the buttons frame changes size
+        def _update_sidebar_scrollregion(event=None):
+            self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
+        self.buttons_frame.bind("<Configure>", _update_sidebar_scrollregion)
+        # Optionally, make the buttons frame width track the canvas width
+        def _resize_sidebar_frame(event):
+            self.sidebar_canvas.itemconfig("buttons_frame", width=event.width)
+        self.sidebar_canvas.bind("<Configure>", _resize_sidebar_frame)
+
+        # Enable mouse wheel scrolling within the sidebar.  Without this binding,
+        # the canvas will not respond to the scroll wheel.  Bindings are
+        # platform-specific: Windows uses <MouseWheel> with delta values, while
+        # Linux often uses Button-4/Button-5 for wheel events.  macOS also
+        # supports <MouseWheel> with smaller delta values.
+        def _on_sidebar_mousewheel(event):
+            try:
+                delta = event.delta
+                # On Windows, delta is a multiple of 120; invert to get direction
+                if os.name == "nt":
+                    self.sidebar_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+                else:
+                    # On other platforms, delta may already be small; just use it
+                    if delta != 0:
+                        self.sidebar_canvas.yview_scroll(int(-1 * delta), "units")
+            except Exception:
+                pass
+
+        # Bind the wheel events globally on the root so that the scroll wheel
+        # always controls the sidebar when it is present.  This ensures
+        # compatibility with physical mouse wheels on all platforms.
+        self.root.bind_all("<MouseWheel>", _on_sidebar_mousewheel)
+        # Bind Linux-specific scroll events globally
+        self.root.bind_all("<Button-4>", lambda e: self.sidebar_canvas.yview_scroll(-1, "units"))
+        self.root.bind_all("<Button-5>", lambda e: self.sidebar_canvas.yview_scroll(1, "units"))
+
+        # Create main content area for previews and status
+        self.content = tk.Frame(root, bg=self.light_theme["content_bg"])
+        self.content.pack(side="right", expand=True, fill="both")
+
+        # Initialize list of buttons
         self.buttons = []
-        self.button_frames = []
-        actions = [
+        # Populate the action buttons inside the buttons_frame
+        actions: List[Tuple[str, callable]] = [
             ("Excel to PDF", self.excel_to_pdf),
             ("PDF to Excel", self.pdf_to_excel),
             ("PDF to Word", self.pdf_to_word),
+            ("Word to PDF", self.word_to_pdf),
             ("Compress PDF", self.compress_pdf),
             ("Compress Images", self.compress_images),
             ("Image to PDF", self.image_to_pdf),
             ("Merge PDFs", self.merge_pdfs),
             ("Split PDF", self.split_pdf),
+            ("Rotate Pages", self.rotate_pdf_pages),
             ("PDF to Images", self.pdf_to_images),
             ("Batch Compress PDFs", self.batch_compress),
+            ("Encrypt PDF", self.encrypt_pdf),
+            ("Decrypt PDF", self.decrypt_pdf),
             ("Merge Images to PDF", self.merge_images_to_pdf),
+            ("Add Watermark", self.add_watermark),
             # New functionality: extract all text from a PDF into a plain-text file
             ("PDF to Text", self.pdf_to_text),
+            ("About", self.show_about),
         ]
         for text, command in actions:
-            frame = tk.Frame(self.sidebar, bg=self.sidebar["bg"])
             btn = tk.Button(
-                frame,
+                self.buttons_frame,
                 text=text,
                 command=command,
                 font=("Segoe UI", 10, "bold"),
@@ -131,10 +212,8 @@ class PDFToolkitApp:
                 activebackground=self.light_theme["button_bg"],
                 activeforeground=self.light_theme["button_fg"],
             )
-            btn.pack(fill="x")
-            frame.pack(pady=5, padx=10, fill="x")
+            btn.pack(fill="x", pady=5, padx=10)
             self.buttons.append(btn)
-            self.button_frames.append(frame)
 
         # Status label to display currently selected file or operation status
         self.status_label = tk.Label(
@@ -156,9 +235,27 @@ class PDFToolkitApp:
         self.header_label.pack(pady=(10, 0))
         self.status_label.pack(fill="x", padx=10, pady=5)
 
-        # Canvas to display PDF page previews or images
-        self.preview_canvas = tk.Canvas(self.content, bg=self.light_theme["canvas_bg"])
-        self.preview_canvas.pack(pady=10, expand=True, fill="both")
+        # Container frame and scrollable canvas for previews. When the window
+        # is resized to a small size, scrollbars allow the user to pan around
+        # a large preview. The canvas scrollregion is updated when images
+        # or PDF pages are drawn.
+        self.preview_container = tk.Frame(self.content, bg=self.light_theme["canvas_bg"])
+        self.preview_container.pack(pady=10, expand=True, fill="both")
+        # Canvas where images/PDF pages will be drawn
+        self.preview_canvas = tk.Canvas(self.preview_container, bg=self.light_theme["canvas_bg"])
+        # Vertical and horizontal scrollbars tied to the preview canvas
+        self.preview_vscrollbar = tk.Scrollbar(self.preview_container, orient="vertical",
+                                               command=self.preview_canvas.yview)
+        self.preview_hscrollbar = tk.Scrollbar(self.preview_container, orient="horizontal",
+                                               command=self.preview_canvas.xview)
+        self.preview_canvas.configure(xscrollcommand=self.preview_hscrollbar.set,
+                                      yscrollcommand=self.preview_vscrollbar.set)
+        # Grid layout for canvas and scrollbars
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_vscrollbar.grid(row=0, column=1, sticky="ns")
+        self.preview_hscrollbar.grid(row=1, column=0, sticky="ew")
+        self.preview_container.rowconfigure(0, weight=1)
+        self.preview_container.columnconfigure(0, weight=1)
 
         # Create a bottom frame to hold the progress bar and clear-preview button
         # This positions the clear button next to the progress bar.
@@ -217,16 +314,24 @@ class PDFToolkitApp:
 
         # Sidebar and content backgrounds
         self.sidebar.config(bg=theme["sidebar_bg"])
+        # Update nested sidebar frames and canvas backgrounds
+        if hasattr(self, "top_sidebar_frame"):
+            self.top_sidebar_frame.config(bg=theme["sidebar_bg"])
+        if hasattr(self, "sidebar_canvas"):
+            self.sidebar_canvas.config(bg=theme["sidebar_bg"])
+        if hasattr(self, "buttons_frame"):
+            self.buttons_frame.config(bg=theme["sidebar_bg"])
         self.content.config(bg=theme["content_bg"])
-        for frame in getattr(self, "button_frames", []):
-            frame.config(bg=theme["sidebar_bg"])
 
         # Header and status labels
         self.header_label.config(bg=theme["content_bg"], fg=theme["header_fg"])
         self.status_label.config(bg=theme["content_bg"], fg=theme["label_fg"])
 
-        # Preview canvas
+        # Preview canvas and container scrollbars
         self.preview_canvas.config(bg=theme["canvas_bg"])
+        # Ensure container matches canvas background
+        if hasattr(self, "preview_container"):
+            self.preview_container.config(bg=theme["canvas_bg"])
 
         # Buttons styling
         for btn in self.buttons:
@@ -425,7 +530,7 @@ class PDFToolkitApp:
             )
 
     def get_dropped_files(
-        self, allowed_exts: tuple[str, ...], multiple: bool = False
+        self, allowed_exts: Tuple[str, ...], multiple: bool = False
     ) -> Optional[List[str]]:
         """
         Return dropped file(s) if available and matching the expected extensions.
@@ -500,7 +605,7 @@ class PDFToolkitApp:
             from reportlab.lib.styles import getSampleStyleSheet
 
             # Build a story (list of flowables) containing a table per sheet
-            story: list = []
+            story: List = []
             styles = getSampleStyleSheet()
             for sheet_name, df in sheets_dict.items():
                 # Ensure all values are strings to avoid issues with floats/NaNs
@@ -566,6 +671,7 @@ class PDFToolkitApp:
                 bottomMargin=0.5 * inch,
             )
             # Remove the final PageBreak so there isn't a blank page at the end
+            from reportlab.platypus import PageBreak
             if isinstance(story[-1], PageBreak):
                 story.pop()
             doc.build(story)
@@ -602,7 +708,7 @@ class PDFToolkitApp:
         self.root.update()
         try:
             output_path = os.path.splitext(pdf_path)[0] + "_extracted.txt"
-            extracted_text = []
+            extracted_text: List[str] = []
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, start=1):
                     try:
@@ -770,7 +876,9 @@ class PDFToolkitApp:
             self.progress.stop()
 
     def pdf_to_word(self) -> None:
-        """Convert a PDF file (or a range of pages) to a Word (.docx) document."""
+        """
+        Convert a PDF file (or a range of pages) to a Word (.docx) document.
+        """
         pdf_path = None
         dropped = self.get_dropped_files((".pdf",), multiple=False)
         if dropped:
@@ -835,6 +943,60 @@ class PDFToolkitApp:
             self.status_label.config(text=f"Saved as: {os.path.basename(docx_path)}")
             messagebox.showinfo("Success", f"Word document saved as {docx_path}")
         except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.progress.stop()
+
+    def word_to_pdf(self) -> None:
+        """
+        Convert a Word (.docx/.doc) document to PDF. Requires MS Word on Windows.
+        Attempts to use docx2pdf if available, otherwise falls back to COM automation.
+        """
+        doc_path = None
+        dropped = self.get_dropped_files((".docx", ".doc"), multiple=False)
+        if dropped:
+            doc_path = dropped[0]
+        else:
+            doc_path = filedialog.askopenfilename(filetypes=[("Word Files", "*.docx *.doc")])
+        if not doc_path:
+            return
+
+        self.status_label.config(text=f"Selected: {os.path.basename(doc_path)}")
+        self.progress.start()
+        self.root.update()
+        try:
+            pdf_path = os.path.splitext(doc_path)[0] + ".pdf"
+            # Prefer docx2pdf if available
+            if docx2pdf_convert is not None:
+                try:
+                    docx2pdf_convert(doc_path, pdf_path)
+                except Exception:
+                    # fallback to COM
+                    if win32com:
+                        word = win32com.client.Dispatch("Word.Application")  # type: ignore
+                        word.Visible = False
+                        doc = word.Documents.Open(doc_path)  # type: ignore
+                        # 17 = wdFormatPDF
+                        doc.SaveAs(pdf_path, FileFormat=17)  # type: ignore
+                        doc.Close(False)  # type: ignore
+                        word.Quit()
+                    else:
+                        raise
+            else:
+                # Use COM if docx2pdf is not available
+                if win32com:
+                    word = win32com.client.Dispatch("Word.Application")  # type: ignore
+                    word.Visible = False
+                    doc = word.Documents.Open(doc_path)  # type: ignore
+                    doc.SaveAs(pdf_path, FileFormat=17)  # type: ignore
+                    doc.Close(False)  # type: ignore
+                    word.Quit()
+                else:
+                    raise RuntimeError("Neither docx2pdf nor win32com are available.")
+            self.status_label.config(text=f"Saved as: {os.path.basename(pdf_path)}")
+            self.preview_pdf_page(pdf_path)
+            messagebox.showinfo("Success", f"PDF saved as:\n{pdf_path}")
+        except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
             self.progress.stop()
@@ -1047,6 +1209,10 @@ class PDFToolkitApp:
             x = max(0, (max_width - new_width) // 2)
             y = max(0, (max_height - new_height) // 2)
             self.preview_canvas.create_image(x, y, anchor="nw", image=self.tk_img)
+            # Update scrollregion and reset view for the preview canvas
+            self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
+            self.preview_canvas.xview_moveto(0)
+            self.preview_canvas.yview_moveto(0)
         except Exception as e:  # noqa: BLE001
             print("Preview error:", e)
 
@@ -1101,6 +1267,242 @@ class PDFToolkitApp:
                 self.preview_pdf_page(save_path)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Error", str(e))
+
+    def rotate_pdf_pages(self) -> None:
+        """
+        Rotate pages of a PDF by a specified angle.
+
+        Prompts the user to select a PDF, enter the rotation angle (90/180/270),
+        and optionally specify a page range. Saves a new PDF with rotated pages.
+        """
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not pdf_path:
+            return
+
+        try:
+            angle = simpledialog.askinteger(
+                "Rotation Angle",
+                "Enter rotation angle (90, 180, 270):",
+                minvalue=90,
+                maxvalue=270,
+            )
+            if angle not in (90, 180, 270):
+                messagebox.showwarning("Invalid Angle", "Please enter 90, 180, or 270.")
+                return
+            reader = PdfReader(pdf_path)
+            total_pages = len(reader.pages)
+            # Ask for page range
+            first_page_in = simpledialog.askinteger(
+                "Start Page",
+                f"Enter start page (1 to {total_pages}) (default 1):",
+                minvalue=1,
+                maxvalue=total_pages,
+            )
+            if first_page_in is None:
+                first_page_in = 1
+            last_page_in = simpledialog.askinteger(
+                "End Page",
+                f"Enter end page (between {first_page_in} and {total_pages}) (default {total_pages}):",
+                minvalue=first_page_in,
+                maxvalue=total_pages,
+            )
+            if last_page_in is None:
+                last_page_in = total_pages
+            writer = PdfWriter()
+            for i, page in enumerate(reader.pages, start=1):
+                if first_page_in <= i <= last_page_in:
+                    rotated = page.rotate(angle)
+                    writer.add_page(rotated)
+                else:
+                    writer.add_page(page)
+            save_path = os.path.splitext(pdf_path)[0] + f"_rotated{angle}.pdf"
+            save_path = filedialog.asksaveasfilename(
+                initialfile=os.path.basename(save_path),
+                defaultextension=".pdf",
+                filetypes=[("PDF Files", "*.pdf")],
+            )
+            if save_path:
+                with open(save_path, "wb") as f:
+                    writer.write(f)
+                messagebox.showinfo("Success", f"Rotated PDF saved as:\n{save_path}")
+                self.preview_pdf_page(save_path)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def encrypt_pdf(self) -> None:
+        """
+        Encrypt a PDF with a user-supplied password.
+        Uses PyPDF2 or pikepdf if available.
+        """
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not pdf_path:
+            return
+        password = simpledialog.askstring(
+            "Set Password", "Enter a password to encrypt the PDF:", show="*"
+        )
+        if not password:
+            return
+        self.progress.start()
+        self.root.update()
+        try:
+            # Attempt with pikepdf if available (handles preservation of metadata)
+            if pikepdf is not None:
+                with pikepdf.Pdf.open(pdf_path) as pdf:
+                    output_path = os.path.splitext(pdf_path)[0] + "_encrypted.pdf"
+                    pdf.save(
+                        output_path,
+                        encryption=pikepdf.Encryption(owner=password, user=password),
+                    )
+            else:
+                reader = PdfReader(pdf_path)
+                writer = PdfWriter()
+                for page in reader.pages:
+                    writer.add_page(page)
+                writer.encrypt(user_pwd=password, owner_pwd=password)
+                output_path = os.path.splitext(pdf_path)[0] + "_encrypted.pdf"
+                with open(output_path, "wb") as f:
+                    writer.write(f)
+            self.status_label.config(text=f"Encrypted: {os.path.basename(output_path)}")
+            messagebox.showinfo("Success", f"Encrypted PDF saved as:\n{output_path}")
+            self.preview_pdf_page(output_path)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.progress.stop()
+
+    def decrypt_pdf(self) -> None:
+        """
+        Remove password protection from a PDF. Prompts for the password.
+        """
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not pdf_path:
+            return
+        password = simpledialog.askstring(
+            "PDF Password", "Enter the current password:", show="*"
+        )
+        if password is None:
+            return
+        self.progress.start()
+        self.root.update()
+        try:
+            # Try with pikepdf first
+            if pikepdf is not None:
+                try:
+                    with pikepdf.Pdf.open(pdf_path, password=password) as pdf:
+                        output_path = os.path.splitext(pdf_path)[0] + "_decrypted.pdf"
+                        pdf.save(output_path)
+                except pikepdf.PasswordError:
+                    messagebox.showerror("Error", "Incorrect password or unable to decrypt.")
+                    return
+            else:
+                try:
+                    reader = PdfReader(pdf_path)
+                    if reader.is_encrypted:
+                        reader.decrypt(password)
+                    writer = PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    output_path = os.path.splitext(pdf_path)[0] + "_decrypted.pdf"
+                    with open(output_path, "wb") as f:
+                        writer.write(f)
+                except Exception:
+                    messagebox.showerror("Error", "Incorrect password or unable to decrypt.")
+                    return
+            self.status_label.config(text=f"Decrypted: {os.path.basename(output_path)}")
+            messagebox.showinfo("Success", f"Decrypted PDF saved as:\n{output_path}")
+            self.preview_pdf_page(output_path)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.progress.stop()
+
+    def add_watermark(self) -> None:
+        """
+        Add a text watermark to each page of a PDF.
+
+        Prompts the user for a PDF, watermark text, and outputs a new PDF with the
+        watermark applied on each page.
+        """
+        pdf_path = None
+        dropped = self.get_dropped_files((".pdf",), multiple=False)
+        if dropped:
+            pdf_path = dropped[0]
+        else:
+            pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not pdf_path:
+            return
+        watermark_text = simpledialog.askstring("Watermark Text", "Enter the watermark text:")
+        if not watermark_text:
+            return
+        self.progress.start()
+        self.root.update()
+        try:
+            # Create a temporary watermark PDF in memory
+            import io
+            packet = io.BytesIO()
+            c = canvas.Canvas(packet, pagesize=reportlab_letter)
+            width, height = reportlab_letter
+            c.setFont("Helvetica", 40)
+            c.setFillColorRGB(0.6, 0.6, 0.6, alpha=0.3)  # semi-transparent grey
+            c.saveState()
+            # rotate text at an angle and center
+            c.translate(width / 2, height / 2)
+            c.rotate(45)
+            c.drawCentredString(0, 0, watermark_text)
+            c.restoreState()
+            c.showPage()
+            c.save()
+            packet.seek(0)
+            watermark_reader = PdfReader(packet)
+            watermark_page = watermark_reader.pages[0]
+            reader = PdfReader(pdf_path)
+            writer = PdfWriter()
+            for page in reader.pages:
+                page.merge_page(watermark_page)
+                writer.add_page(page)
+            save_path = os.path.splitext(pdf_path)[0] + "_watermarked.pdf"
+            save_path = filedialog.asksaveasfilename(
+                initialfile=os.path.basename(save_path),
+                defaultextension=".pdf",
+                filetypes=[("PDF Files", "*.pdf")],
+            )
+            if save_path:
+                with open(save_path, "wb") as f:
+                    writer.write(f)
+                messagebox.showinfo("Success", f"Watermarked PDF saved as:\n{save_path}")
+                self.preview_pdf_page(save_path)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.progress.stop()
+
+    def show_about(self) -> None:
+        """
+        Display an About dialog showing version and credits.
+        """
+        about_text = (
+            "PDF Toolkit\n"
+            "Version 1.0.0\n\n"
+            "This application provides a suite of tools for converting,"
+            " compressing, securing and manipulating PDF and image files.\n\n"
+            "Developed using Python, Tkinter and various open source libraries."
+        )
+        messagebox.showinfo("About PDF Toolkit", about_text)
 
     def pdf_to_images(self) -> None:
         """
@@ -1216,14 +1618,14 @@ class PDFToolkitApp:
                         for page in doc:
                             zoom = 150 / 72.0
                             mat = fitz.Matrix(zoom, zoom)
-                    pix = page.get_pixmap(matrix=mat)  # type: ignore[attr-defined]
-                    img = Image.frombytes(
-                        "RGB", (pix.width, pix.height), pix.samples
-                    )
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=80)
-                    page.clean_contents()
-                    page.insert_image(page.rect, stream=buf.getvalue())  # type: ignore[attr-defined]
+                            pix = page.get_pixmap(matrix=mat)  # type: ignore[attr-defined]
+                            img = Image.frombytes(
+                                "RGB", (pix.width, pix.height), pix.samples
+                            )
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=80)
+                            page.clean_contents()
+                            page.insert_image(page.rect, stream=buf.getvalue())  # type: ignore[attr-defined]
                         doc.save(output)
                         doc.close()
                 except Exception:
@@ -1271,6 +1673,11 @@ class PDFToolkitApp:
                 x = max(0, (max_width - new_width) // 2)
                 y = max(0, (max_height - new_height) // 2)
                 self.preview_canvas.create_image(x, y, anchor="nw", image=self.tk_img)
+                # Update scrollregion so that scrollbars reflect the drawn content
+                self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
+                # Reset the scroll position to the top-left
+                self.preview_canvas.xview_moveto(0)
+                self.preview_canvas.yview_moveto(0)
         except Exception as e:  # noqa: BLE001
             self.status_label.config(text=f"Preview unavailable: {e}")
 
@@ -1354,8 +1761,7 @@ class PDFToolkitApp:
         TIFF, GIF, ICO, WEBP, etc.) and then compresses each one using a
         predefined JPEG quality (75%) and scaling factor (100%, i.e., no
         resizing). Images are converted to RGB if necessary, then saved as
-        JPEGs alongside the originals with a ``_compressed`` suffix.  By using
-        fixed defaults, the function avoids confusing prompts for layman users.
+        JPEGs alongside the originals with a ``_compressed`` suffix.
 
         Unsupported or unreadable files are silently skipped, and a preview of
         the first compressed image is displayed in the preview pane.
@@ -1383,7 +1789,7 @@ class PDFToolkitApp:
         if not img_paths:
             return
 
-        # Use default compression settings suitable for layman users
+        # Use default compression settings
         quality = 75  # JPEG quality percentage
         scale = 100   # Scaling percentage (100% = no scaling)
 
@@ -1450,6 +1856,10 @@ class PDFToolkitApp:
                         x = max(0, (max_width - new_width) // 2)
                         y = max(0, (max_height - new_height) // 2)
                         self.preview_canvas.create_image(x, y, anchor="nw", image=self.tk_img)
+                        # Update scrollregion and reset the scroll position
+                        self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
+                        self.preview_canvas.xview_moveto(0)
+                        self.preview_canvas.yview_moveto(0)
                     except Exception:
                         pass
                 self.status_label.config(text="Image compression complete")
